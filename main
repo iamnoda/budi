@@ -1,0 +1,138 @@
+import logging
+from flask import Flask, request, abort
+from google.api_core.client_options import ClientOptions
+from google.cloud import discoveryengine_v1beta as discoveryengine
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import genai  # This is assuming you have a package for generative AI
+
+app = Flask(__name__)
+
+#ตั้งค่า logging
+logging.basicConfig(level=logging.INFO)
+
+#Configuration
+project_id = ""
+location = "global"
+engine_id = ""
+
+#Line Bot Configuration
+line_bot_api = LineBotApi('')
+handler = WebhookHandler('')
+
+#Gemini Pro Configuration
+genai.configure(api_key="")
+
+def search_sample(project_id, location, engine_id, search_query):
+	client_options = ClientOptions(api_endpoint=f"{location}-discoveryengine.googleapis.com") if location != "global" else None
+	Client = discoveryengine.SearchServiceClient(client_options=client_options)
+	serving_config = f"projects/{project_id}/locations/{location}/collections/default_collection/engines/{engine_id}/servingConfigs/default:search"
+
+	content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
+		entractive_content_spec = discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(max_extractive_segment_count = 10), 
+		snippet_spec = discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(return_snippet=False)
+	)
+
+	request = discoveryengine.SearchRequest(
+		serving_config = serving_config,
+		query = search_query,
+		page_size=5,
+		content_search_spec = content_search_spec,
+		query_expansion_spec = discoveryengine.SearchRequest.QueryExpansionSpec(condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO)
+		spell_correction_spec = discoveryengine.SearchRequest.SpellCorrectionSpec(mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO)
+	)
+	return client.search(request)
+
+def get_segments_with_metadata(response):
+	results = []
+	for result in response.results:
+		document = result.document
+		segments = []
+		if document.derived_struct_data:
+			extracted_content = document.derived_struct_data.get('extractive_segments',[])
+			for segment in extracted_content:
+				segments.append({
+						'content': segment.get('content',''),
+						'score'	: segment.get('relevanceScore',0)
+					})
+		results.append({
+			'title' : document.derived_struct_data.get('title',''),
+			'link' : document.derived_struct_data.get('link',''),
+			'segments': segments
+		})
+	return results
+
+def prepare_context_for_rag(results):
+	context = ""
+	for result in results:
+		context += f"Title: {result['title']}\n"
+		context += f"Link: {result['link']}\n"
+		context += "Content:\n"
+		for segment in result['segments']:
+			context += f"- {segment['content']}\n"
+		context += "\n"
+	return context
+
+
+def generate_response_with_gemini(context, user_query):
+	model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    
+    # Set the parameters for the model generation, such as maximum tokens, temperature, etc.
+    parameters = genai.GenerationParameters(
+        max_tokens=150,  # Adjust based on the length of the expected response
+        temperature=0.7,  # Adjust to control the creativity of the output
+        top_p=0.9  # Adjust for controlling the diversity of the output
+    )
+
+	prompt = f"""จงอ่านและวิเคราะห์เนื้อหาในบริบทที่ให้มา เพื่อใช้ตอบคำถามโดยใช้ข้อมูลจากบริบทที่ให้มาแบบสรุปแต่เนื้อหาครบถ้วน พยายามตอบให้ได้มากที่สุดถ้าไม่มีข้อมูลเพียงพอ แล้วก็ให้แทนตัวเองว่า น้อง BUDi เป็น unisex ตอบแบบสุภาพ ข้อมูลต่อไปนี้เป็นบริบทที่เกี่ยวข้องกับคำถาม ให้ใช้ข้อมูลนี้ในการตอบคำถาม:
+
+	{context}
+
+	คำถาม: {user_query}
+	คำตอบ:
+	"""
+
+	    response = model.generate_content(prompt, parameters)
+
+		return response.text
+
+def process_user_message(user_message):
+	user_message = "ก่อนตอบให้บอกด้วยนะว่าเนื้อหาที่ได้มาเกี่ยวกับอะไร\n\n" + user_message
+	response = search_sample(project_id, location, engine_id, user_message)
+	results = get_segments_with_metadata(response)
+	context = prepare_context_for_rag(results)
+	return generate_response_with_gemini(context, user_message)
+
+@app.route("/callback", methods = ['POST'])
+def callback():
+	signature = request.headers['X-Line-Signature']
+	body = request.get_data(as_text=True)
+	app.logger.info("Request body: " + body)
+
+	try:
+		handler.handle(body, signature)
+	except InvalidSignatureError:
+		abort(400)
+
+	return 'OK'
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+	try:
+		user_message = event.message.Text
+		app.logger.info(f"Received message: {user_message}")
+
+		bot_response = process_user_message(user_message)
+
+		line_bot_api.reply_message(
+			event.reply_token,
+			TextSendMessage(text=bot_response)
+		)
+	except Exception as e:
+		app.logger.error(f"Error in handle_message: {str(e)}")
+
+if __name__ == "__main__":
+	app.run(debug=True, host= '0.0.0.0' , port=8080)
+
+
